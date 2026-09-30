@@ -31,6 +31,8 @@ header.top .t2{font-size:13px;opacity:.85}
 .wm span{font:700 22vw/1 "Source Sans 3",sans-serif;color:rgba(214,47,53,.06);transform:rotate(-35deg);white-space:nowrap}
 main{position:relative;z-index:2}
 #draftbar{position:sticky;top:0;z-index:20}
+.okbar{background:#e7f5ec;color:#1d6b3a;border-bottom:1px solid #b9e0c6;text-align:center;font:600 14px "Source Sans 3",sans-serif;padding:8px 12px}
+.btn[disabled]{opacity:.6;cursor:wait}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-top:16px}
 .crumbs{margin-top:14px;font-size:14px}
 .crumbs a{text-decoration:none}
@@ -135,9 +137,53 @@ function el(tag,cls,html){ var e=document.createElement(tag); if(cls) e.classNam
 function chev(){ return '<span class="chev" aria-hidden="true">▾</span>'; }
 function cellHtml(parts){ return parts.map(function(p){return p.html;}).join('<br>').replace(/(<br>\s*){3,}/g,'<br><br>'); }
 
-function setDraft(on){
-  document.getElementById('draftbar').innerHTML = on ? '<div class="draftbar">DRAFT · for EC review, not final</div>' : '';
+function setDraft(on, conf){
+  document.getElementById('draftbar').innerHTML = on ? '<div class="draftbar">DRAFT · for EC review, not final</div>' :
+    (conf ? '<div class="okbar">✓ CONFIRMED'+(conf==='signed'?' · signed copy available':'')+'</div>' : '');
   document.getElementById('wm').innerHTML = on ? '<div class="wm"><span>DRAFT</span></div>' : '';
+}
+
+var PDFLIB = 'https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js';
+function loadPdfLib(){
+  return window.PDFLib ? Promise.resolve() : new Promise(function(ok,no){
+    var s=document.createElement('script'); s.src=PDFLIB; s.onload=ok; s.onerror=function(){no(new Error('Could not load PDF tools'));}; document.head.appendChild(s);
+  });
+}
+function b64bytes(b){ var s=atob(b), a=new Uint8Array(s.length); for(var i=0;i<s.length;i++) a[i]=s.charCodeAt(i); return a; }
+function stampDraft(bytes){
+  var L;
+  return loadPdfLib().then(function(){ L=window.PDFLib; return Promise.all([L.PDFDocument.load(bytes), L.PDFDocument.create()]); }).then(function(r){
+    var src=r[0], out=r[1];
+    return Promise.all([out.embedPages(src.getPages()), out.embedFont(L.StandardFonts.HelveticaBold)]).then(function(r2){
+      var font=r2[1], red=L.rgb(0.84,0.18,0.21), note='DRAFT - for EC review, not final';
+      r2[0].forEach(function(ep){
+        var w=ep.width, h=ep.height, p=out.addPage([w,h]);
+        p.drawPage(ep,{x:0,y:0,width:w,height:h});
+        var size=Math.min(w,h)*0.28, tw=font.widthOfTextAtSize('DRAFT',size);
+        var ang=Math.atan2(h,w), c=Math.cos(ang), sn=Math.sin(ang), dx=(tw/2)*c-(size*0.35)*sn, dy=(tw/2)*sn+(size*0.35)*c;
+        p.drawText('DRAFT',{x:w/2-dx, y:h/2-dy, size:size, font:font, color:red, opacity:0.13, rotate:L.degrees(ang*180/Math.PI)});
+        p.drawText(note,{x:(w-font.widthOfTextAtSize(note,9))/2, y:h-18, size:9, font:font, color:red, opacity:0.8});
+      });
+      out.setTitle(src.getTitle()||'Minutes (DRAFT)');
+      return out.save();
+    });
+  });
+}
+function saveBlob(bytes, name){
+  var url=URL.createObjectURL(new Blob([bytes],{type:'application/pdf'}));
+  var a=document.createElement('a'); a.href=url; a.download=name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(function(){ URL.revokeObjectURL(url); }, 60000);
+}
+function downloadPdf(id, btn){
+  var label=btn.innerHTML; btn.disabled=true; btn.innerHTML='Preparing PDF…';
+  fetch(API+'?api=pdf&m='+encodeURIComponent(id),{credentials:'omit'}).then(function(r){ return r.json(); }).then(function(j){
+    if(!j.ok) throw new Error(j.error||'Error');
+    var d=j.data, bytes=b64bytes(d.b64);
+    var base=d.name.replace(/^EC 2026-27\s*/,'').replace(/[\\/:*?"<>|]/g,'');
+    if(d.draft) return stampDraft(bytes).then(function(b){ saveBlob(b, base+' (DRAFT).pdf'); });
+    saveBlob(bytes, base+(d.signed?' (Signed)':'')+'.pdf');
+  }).catch(function(e){ alert('Sorry, the PDF could not be prepared. '+(e&&e.message||'')); })
+    .then(function(){ btn.disabled=false; btn.innerHTML=label; });
 }
 
 function showList(){
@@ -166,7 +212,7 @@ function openMeeting(id,push){
 }
 
 function renderMeeting(d){
-  setDraft(d.draft);
+  setDraft(d.draft, d.draft ? '' : (d.signed ? 'signed' : 'yes'));
   document.title = 'EC Mtg '+(d.title.match(/EC Mtg (\d+)/)||['',''])[1]+' Minutes | SSKZM OBA';
   var B = d.blocks, i = 0, out = el('div');
   out.appendChild(el('div','crumbs','<a href="./" id="back">‹ All meetings</a>'));
@@ -188,8 +234,9 @@ function renderMeeting(d){
     facts.rows.forEach(function(r){ dl+='<dt>'+text(cellHtml(r[0]))+'</dt><dd>'+cellHtml(r[1]||[])+'</dd>'; });
     head.innerHTML += dl+'</dl>';
   }
-  head.innerHTML += '<div class="btns"><a class="btn primary" href="'+d.pdfUrl+'" target="_blank" rel="noopener">⬇ PDF</a>'+
-    '<a class="btn" href="'+d.docUrl+'" target="_blank" rel="noopener">✎ Comment / suggest edits</a></div>';
+  head.innerHTML += '<div class="btns"><button class="btn primary" id="pdfbtn">⬇ PDF'+(d.draft?' (draft)':(d.signed?' (signed)':''))+'</button>'+
+    (d.draft ? '<a class="btn" href="'+d.docUrl+'" target="_blank" rel="noopener">✎ Comment / suggest edits</a>' : '')+'</div>';
+  head.querySelector('#pdfbtn').onclick = function(){ downloadPdf(d.id, this); };
 
   var tools = el('div','tools','<button class="linkbtn" id="expand">Expand all</button>'); out.appendChild(tools);
 
